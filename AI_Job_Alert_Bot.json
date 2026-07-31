@@ -1,0 +1,171 @@
+{
+  "name": "AI Job Alert Bot",
+  "nodes": [
+    {
+      "id": "d836bf9d-9dbb-4521-a7e7-e9ed69960c85",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3cdfcd7d-7aa8-4eb5-bad0-6f0552a19552",
+      "name": "Fetch Job Listings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 0],
+      "parameters": {
+        "url": "https://www.arbeitnow.com/api/job-board-api",
+        "method": "GET",
+        "options": {}
+      },
+      "notes": "Free, no-auth job board API. Swap for RemoteOK, Adzuna, or any other job API/RSS feed if you prefer."
+    },
+    {
+      "id": "4a71946b-28e1-4082-95f2-b28d8073676f",
+      "name": "Filter & Prep Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// EDIT ME: keywords to pre-filter jobs before spending AI calls on them.\nconst keywords = [\n  \"python\", \"fastapi\", \"streamlit\", \"langchain\", \"machine learning\",\n  \"ai engineer\", \"backend\", \"react\", \"full stack\"\n];\n\n// Arbeitnow doesn't always return tags/job_types as an array -- sometimes\n// it's a string, sometimes missing entirely. Normalize defensively.\nfunction toArray(val) {\n  if (Array.isArray(val)) return val;\n  if (typeof val === 'string' && val.trim()) return [val];\n  return [];\n}\n\nconst response = $input.first().json;\nconst jobs = response.data || [];\n\nconst matched = jobs.filter(job => {\n  const haystack = `${job.title || ''} ${toArray(job.tags).join(' ')} ${toArray(job.job_types).join(' ')}`.toLowerCase();\n  return keywords.some(kw => haystack.includes(kw.toLowerCase()));\n});\n\n// Cap how many jobs get sent to the AI scoring step each run, to control API usage\nconst limited = matched.slice(0, 15);\n\nreturn limited.map(job => ({\n  json: {\n    slug: job.slug,\n    title: job.title,\n    company_name: job.company_name,\n    description_snippet: (job.description || '').replace(/<[^>]*>/g, ' ').slice(0, 1200),\n    url: job.url,\n    tags: toArray(job.tags),\n    remote: job.remote,\n    location: job.location\n  }\n}));"
+      }
+    },
+    {
+      "id": "a5d56004-54fb-42aa-81de-7f7b348d54a2",
+      "name": "Skip Already Seen",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 0],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Deduplicates jobs across runs using n8n's built-in workflow static data\n// (persisted with the workflow -- no external database needed).\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.seenSlugs) staticData.seenSlugs = [];\n\nconst newItems = $input.all().filter(item => !staticData.seenSlugs.includes(item.json.slug));\n\n// Mark these as seen now so they aren't re-scored (and re-alerted) on the next run\nnewItems.forEach(item => staticData.seenSlugs.push(item.json.slug));\n\n// Keep the seen list from growing forever\nif (staticData.seenSlugs.length > 500) {\n  staticData.seenSlugs = staticData.seenSlugs.slice(-500);\n}\n\nreturn newItems;"
+      }
+    },
+    {
+      "id": "8fefe194-a37e-45eb-9f74-786d5a28bf49",
+      "name": "Score Match with AI",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 0],
+      "parameters": {
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "method": "POST",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"openai/gpt-oss-20b\",\n  temperature: 0,\n  response_format: { type: \"json_object\" },\n  messages: [\n    {\n      role: \"system\",\n      content: \"You are a job-matching assistant. Compare the CANDIDATE PROFILE below to the job posting the user provides, and respond with ONLY a JSON object: {\\\"score\\\": <integer 0-100>, \\\"reason\\\": \\\"<one sentence explaining the score>\\\"}.\\n\\nCANDIDATE PROFILE (EDIT ME):\\nPython/AI developer experienced with FastAPI, Streamlit, LangChain, ChromaDB, and the Groq API. Comfortable with React/Vite frontends, Docker, and n8n automation. Looking for remote backend or AI engineering roles.\"\n    },\n    {\n      role: \"user\",\n      content: \"Job Title: \" + $json.title + \"\\nCompany: \" + $json.company_name + \"\\nTags: \" + ($json.tags || []).join(\", \") + \"\\nRemote: \" + $json.remote + \"\\nLocation: \" + $json.location + \"\\nDescription: \" + $json.description_snippet\n    }\n  ]\n}) }}",
+        "options": {}
+      },
+      "notes": "Requires an 'HTTP Header Auth' credential named e.g. 'Groq API' with Header Name = Authorization and Header Value = Bearer YOUR_GROQ_API_KEY. Set up under n8n Credentials -- do NOT hardcode the key in this node."
+    },
+    {
+      "id": "c260a842-351a-4fd2-a839-3e3a34d6aa06",
+      "name": "Parse AI Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 0],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = $input.item.json.choices[0].message.content;\n\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  parsed = { score: 0, reason: 'Could not parse AI response' };\n}\n\n// Pull the original job fields back in from the pre-AI step (the HTTP\n// Request node's output replaced $json with the raw API response).\nconst job = $('Skip Already Seen').item.json;\n\nreturn {\n  json: {\n    ...job,\n    score: parsed.score,\n    reason: parsed.reason\n  }\n};"
+      }
+    },
+    {
+      "id": "43233e75-1e56-4aed-9187-96af2fd5376e",
+      "name": "Good Match?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1440, 0],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "score-threshold",
+              "leftValue": "={{ $json.score }}",
+              "rightValue": 65,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "EDIT ME: change 65 to your preferred minimum match score (0-100). 65 was validated as a working default."
+    },
+    {
+      "id": "a9bdad22-c716-4c80-b69e-55df1b222869",
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, -80],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL_HERE",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: \"🎯 *New Job Match (\" + $json.score + \"%)*\\n*\" + $json.title + \"* at *\" + $json.company_name + \"*\\n_Why:_ \" + $json.reason + \"\\n📍 \" + $json.location + ($json.remote ? \" (Remote)\" : \"\") + \"\\n🔗 \" + $json.url }) }}",
+        "options": {}
+      },
+      "notes": "EDIT ME: replace with your Slack Incoming Webhook URL (or swap this node for the built-in Telegram/Email/Discord node)."
+    },
+    {
+      "id": "b452beba-e427-4949-8af3-e3be840c4d18",
+      "name": "No Match - Do Nothing",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1680, 80],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [[{ "node": "Fetch Job Listings", "type": "main", "index": 0 }]]
+    },
+    "Fetch Job Listings": {
+      "main": [[{ "node": "Filter & Prep Jobs", "type": "main", "index": 0 }]]
+    },
+    "Filter & Prep Jobs": {
+      "main": [[{ "node": "Skip Already Seen", "type": "main", "index": 0 }]]
+    },
+    "Skip Already Seen": {
+      "main": [[{ "node": "Score Match with AI", "type": "main", "index": 0 }]]
+    },
+    "Score Match with AI": {
+      "main": [[{ "node": "Parse AI Score", "type": "main", "index": 0 }]]
+    },
+    "Parse AI Score": {
+      "main": [[{ "node": "Good Match?", "type": "main", "index": 0 }]]
+    },
+    "Good Match?": {
+      "main": [
+        [{ "node": "Send Slack Alert", "type": "main", "index": 0 }],
+        [{ "node": "No Match - Do Nothing", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

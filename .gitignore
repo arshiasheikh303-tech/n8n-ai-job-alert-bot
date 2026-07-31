@@ -1,0 +1,6 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# n8n local exports/backups if you keep any locally
+*.n8n_backup
